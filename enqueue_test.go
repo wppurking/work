@@ -174,6 +174,52 @@ func TestEnqueueUnique(t *testing.T) {
 	assert.NotNil(t, job)
 }
 
+// A job can be enqueued again only if after it is done, instead of just taking by a worker.
+func TestEnqueueUniqueAfterJobDone(t *testing.T){
+	pool := newTestPool(":6379")
+	ns := "work"
+	cleanKeyspace(ns, pool)
+	enqueuer := NewEnqueuer(ns, pool)
+	var mutex = &sync.Mutex{}
+
+	var wats int64
+	wp := NewWorkerPool(TestContext{}, 3, ns, pool)
+	wp.JobWithOptions("wat", JobOptions{Priority: 1, MaxFails: 1}, func(job *Job) error {
+		mutex.Lock()
+		wats++
+		time.Sleep(time.Millisecond*100)
+		mutex.Unlock()
+		return nil
+	})
+
+	// enqueue a job
+	job, err := enqueuer.EnqueueUnique("wat", nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, job)
+
+	// Start workers
+	assert.EqualValues(t, 0, wats)
+	wp.Start()
+	time.Sleep(time.Millisecond*10)
+	assert.EqualValues(t, 1, wats)
+
+	// Same job is being processed, can not enqueue again.
+	job, err = enqueuer.EnqueueUnique("wat", nil)
+	assert.NoError(t, err)
+	assert.Nil(t, job)
+
+	time.Sleep(time.Millisecond * 110)
+	// After 0.11 second, job is done, can enqueue again
+	job, err = enqueuer.EnqueueUnique("wat", nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, job)
+
+	wp.Drain()
+	wp.Stop()
+
+	assert.EqualValues(t, 2, wats)
+}
+
 func TestEnqueueUniqueIn(t *testing.T) {
 	pool := newTestPool(":6379")
 	ns := "work"

@@ -184,9 +184,11 @@ func (w *worker) fetchJob() (*Job, error) {
 }
 
 func (w *worker) processJob(job *Job) {
-	if job.Unique {
-		w.deleteUniqueJob(job)
-	}
+	defer func() {
+		if job.Unique {
+			w.deleteUniqueJob(job)
+		}
+	}()
 	if jt, ok := w.jobTypes[job.Name]; ok {
 		w.observeStarted(job.Name, job.ID, job.Args)
 		job.observer = w.observer // for Checkin
