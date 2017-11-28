@@ -53,6 +53,7 @@ type JobOptions struct {
 	MaxConcurrency   uint              // Max number of jobs to keep in flight (default is 0, meaning no max)
 	Backoff          BackoffCalculator // If not set, uses the default backoff algorithm
 	StartingDeadline int64             // UTC time in seconds(time.Now().Unix()), the deadline for starting the job if it misses its scheduled time for any reason
+	RetryOnStart     bool              // If true, when a worker pool is started, jobs that are "in progress" will be retried
 }
 
 // GenericHandler is a job handler without any custom context.
@@ -235,7 +236,7 @@ func (wp *WorkerPool) startRequeuers() {
 	}
 	wp.retrier = newRequeuer(wp.namespace, wp.pool, redisKeyRetry(wp.namespace), jobNames)
 	wp.scheduler = newRequeuer(wp.namespace, wp.pool, redisKeyScheduled(wp.namespace), jobNames)
-	wp.deadPoolReaper = newDeadPoolReaper(wp.namespace, wp.pool, jobNames)
+	wp.deadPoolReaper = newDeadPoolReaper(wp.namespace, wp.pool, jobNames, wp.jobTypes)
 	wp.retrier.start()
 	wp.scheduler.start()
 	wp.deadPoolReaper.start()
