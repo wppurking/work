@@ -116,7 +116,7 @@ func TestEnqueueUnique(t *testing.T) {
 		assert.NoError(t, job.ArgError())
 	}
 
-	job, err = enqueuer.EnqueueUnique("wat", Q{"a": 1, "b": "cool"})
+	job, err = enqueuer.EnqueueUnique("wat", Q{"a": 1, "b": "cool"}, WithExpireTime(400))
 	assert.NoError(t, err)
 	assert.Nil(t, job)
 

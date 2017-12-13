@@ -347,9 +347,10 @@ return requeuedCount
 
 // KEYS[1] = job queue to push onto
 // KEYS[2] = Unique job's key. Test for existence and set if we push.
+// KEYS[3] = job expire time. Expired jobs can be enqueued again.
 // ARGV[1] = job
 var redisLuaEnqueueUnique = `
-if redis.call('set', KEYS[2], '1', 'NX', 'EX', '86400') then
+if redis.call('set', KEYS[2], '1', 'NX', 'EX', KEYS[3]) then
   redis.call('lpush', KEYS[1], ARGV[1])
   return 'ok'
 end
@@ -358,10 +359,11 @@ return 'dup'
 
 // KEYS[1] = scheduled job queue
 // KEYS[2] = Unique job's key. Test for existence and set if we push.
+// KEYS[3] = job expire time. Expired jobs can be enqueued again.
 // ARGV[1] = job
 // ARGV[2] = epoch seconds for job to be run at
 var redisLuaEnqueueUniqueIn = `
-if redis.call('set', KEYS[2], '1', 'NX', 'EX', '86400') then
+if redis.call('set', KEYS[2], '1', 'NX', 'EX', KEYS[3]) then
   redis.call('zadd', KEYS[1], ARGV[2], ARGV[1])
   return 'ok'
 end
