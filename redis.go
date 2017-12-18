@@ -81,9 +81,13 @@ func redisKeyUniqueJob(namespace, jobName string, args map[string]interface{}) (
 	buf.WriteRune(':')
 
 	if args != nil {
-		err := json.NewEncoder(&buf).Encode(args)
-		if err != nil {
-			return "", err
+		if v, ok := args[UniqueKeyArg]; ok {
+			buf.WriteString(v.(string))
+		} else {
+			err := json.NewEncoder(&buf).Encode(args)
+			if err != nil {
+				return "", err
+			}
 		}
 	}
 

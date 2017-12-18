@@ -100,7 +100,8 @@ func (e *Enqueuer) EnqueueIn(jobName string, secondsFromNow int64, args map[stri
 }
 
 type EnqueueOp struct {
-	Expire int
+	Expire    int
+	UniqueKey string
 }
 
 type EnqueueOption func(*EnqueueOp)
@@ -108,6 +109,12 @@ type EnqueueOption func(*EnqueueOp)
 func WithExpireTime(expire int) EnqueueOption {
 	return func(op *EnqueueOp) {
 		op.Expire = expire
+	}
+}
+
+func WithUniqueKey(k string) EnqueueOption {
+	return func(op *EnqueueOp) {
+		op.UniqueKey = k
 	}
 }
 
@@ -128,7 +135,7 @@ func (e *Enqueuer) EnqueueUnique(jobName string, args map[string]interface{}, op
 	if op.Expire > 0 {
 		expire = op.Expire
 	}
-	uniqueKey, err := redisKeyUniqueJob(e.Namespace, jobName, args)
+	args, uniqueKey, err := uniqueKey(op, e.Namespace, jobName, args)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +184,7 @@ func (e *Enqueuer) EnqueueUniqueIn(jobName string, secondsFromNow int64, args ma
 		expire = op.Expire
 	}
 
-	uniqueKey, err := redisKeyUniqueJob(e.Namespace, jobName, args)
+	args, uniqueKey, err := uniqueKey(op, e.Namespace, jobName, args)
 	if err != nil {
 		return nil, err
 	}
@@ -221,6 +228,19 @@ func (e *Enqueuer) EnqueueUniqueIn(jobName string, secondsFromNow int64, args ma
 		return scheduledJob, nil
 	}
 	return nil, err
+}
+
+const UniqueKeyArg = "unique_job_key"
+
+func uniqueKey(op *EnqueueOp, namespace, jobName string, args map[string]interface{}) (map[string]interface{}, string, error) {
+	if len(op.UniqueKey) > 0 {
+		if args == nil {
+			args = make(map[string]interface{}, 1)
+		}
+		args[UniqueKeyArg] = op.UniqueKey
+	}
+	k, err := redisKeyUniqueJob(namespace, jobName, args)
+	return args, k, err
 }
 
 func (e *Enqueuer) addToKnownJobs(conn redis.Conn, jobName string) error {
