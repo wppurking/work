@@ -197,7 +197,8 @@ func (w *worker) processJob(job *Job) {
 		}
 		w.observeStarted(job.Name, job.ID, job.Args)
 		job.observer = w.observer // for Checkin
-		_, runErr := runJob(job, w.contextType, w.middleware, jt)
+		middleware := append(w.middleware, jt.middleware...)
+		_, runErr := runJob(job, w.contextType, middleware, jt)
 		w.observeDone(job.Name, job.ID, runErr)
 
 		if runErr != nil {
