@@ -21,19 +21,21 @@ type deadPoolReaper struct {
 	pool        *redis.Pool
 	deadTime    time.Duration
 	reapPeriod  time.Duration
-	curJobTypes []string
+	curJobNames []string
+	jobTypes    map[string]*jobType
 
 	stopChan         chan struct{}
 	doneStoppingChan chan struct{}
 }
 
-func newDeadPoolReaper(namespace string, pool *redis.Pool, curJobTypes []string) *deadPoolReaper {
+func newDeadPoolReaper(namespace string, pool *redis.Pool, curJobNames []string, jobTypes map[string]*jobType) *deadPoolReaper {
 	return &deadPoolReaper{
 		namespace:        namespace,
 		pool:             pool,
 		deadTime:         deadTime,
 		reapPeriod:       reapPeriod,
-		curJobTypes:      curJobTypes,
+		curJobNames:      curJobNames,
+		jobTypes:         jobTypes,
 		stopChan:         make(chan struct{}),
 		doneStoppingChan: make(chan struct{}),
 	}
@@ -83,24 +85,24 @@ func (r *deadPoolReaper) reap() error {
 	workerPoolsKey := redisKeyWorkerPools(r.namespace)
 
 	// Cleanup all dead pools
-	for deadPoolID, jobTypes := range deadPoolIDs {
-		lockJobTypes := jobTypes
+	for deadPoolID, jobNames := range deadPoolIDs {
+		lockJobNames := jobNames
 		// if we found jobs from the heartbeat, requeue them and remove the heartbeat
-		if len(jobTypes) > 0 {
-			r.requeueInProgressJobs(deadPoolID, jobTypes)
+		if len(jobNames) > 0 {
+			r.requeueInProgressJobs(deadPoolID, jobNames)
 			if _, err = conn.Do("DEL", redisKeyHeartbeat(r.namespace, deadPoolID)); err != nil {
 				return err
 			}
 		} else {
 			// try to clean up locks for the current set of jobs if heartbeat was not found
-			lockJobTypes = r.curJobTypes
+			lockJobNames = r.curJobNames
 		}
 		// Remove dead pool from worker pools set
 		if _, err = conn.Do("SREM", workerPoolsKey, deadPoolID); err != nil {
 			return err
 		}
 		// Cleanup any stale lock info
-		if err = r.cleanStaleLockInfo(deadPoolID, lockJobTypes); err != nil {
+		if err = r.cleanStaleLockInfo(deadPoolID, lockJobNames); err != nil {
 			return err
 		}
 	}
@@ -108,13 +110,13 @@ func (r *deadPoolReaper) reap() error {
 	return nil
 }
 
-func (r *deadPoolReaper) cleanStaleLockInfo(poolID string, jobTypes []string) error {
-	numKeys := len(jobTypes) * 2
+func (r *deadPoolReaper) cleanStaleLockInfo(poolID string, jobNames []string) error {
+	numKeys := len(jobNames) * 2
 	redisReapLocksScript := redis.NewScript(numKeys, redisLuaReapStaleLocks)
 	var scriptArgs = make([]interface{}, 0, numKeys+1) // +1 for argv[1]
 
-	for _, jobType := range jobTypes {
-		scriptArgs = append(scriptArgs, redisKeyJobsLock(r.namespace, jobType), redisKeyJobsLockInfo(r.namespace, jobType))
+	for _, jobName := range jobNames {
+		scriptArgs = append(scriptArgs, redisKeyJobsLock(r.namespace, jobName), redisKeyJobsLockInfo(r.namespace, jobName))
 	}
 	scriptArgs = append(scriptArgs, poolID) // ARGV[1]
 
@@ -127,14 +129,16 @@ func (r *deadPoolReaper) cleanStaleLockInfo(poolID string, jobTypes []string) er
 	return nil
 }
 
-func (r *deadPoolReaper) requeueInProgressJobs(poolID string, jobTypes []string) error {
-	numKeys := len(jobTypes) * requeueKeysPerJob
+func (r *deadPoolReaper) requeueInProgressJobs(poolID string, jobNames []string) error {
+	jobNames = r.filterNonRetryJobs(jobNames)
+
+	numKeys := len(jobNames) * requeueKeysPerJob
 	redisRequeueScript := redis.NewScript(numKeys, redisLuaReenqueueJob)
 	var scriptArgs = make([]interface{}, 0, numKeys+1)
 
-	for _, jobType := range jobTypes {
+	for _, jobName := range jobNames {
 		// pops from in progress, push into job queue and decrement the queue lock
-		scriptArgs = append(scriptArgs, redisKeyJobsInProgress(r.namespace, poolID, jobType), redisKeyJobs(r.namespace, jobType), redisKeyJobsLock(r.namespace, jobType), redisKeyJobsLockInfo(r.namespace, jobType)) // KEYS[1-4 * N]
+		scriptArgs = append(scriptArgs, redisKeyJobsInProgress(r.namespace, poolID, jobName), redisKeyJobs(r.namespace, jobName), redisKeyJobsLock(r.namespace, jobName), redisKeyJobsLockInfo(r.namespace, jobName)) // KEYS[1-4 * N]
 	}
 	scriptArgs = append(scriptArgs, poolID) // ARGV[1]
 
@@ -154,6 +158,18 @@ func (r *deadPoolReaper) requeueInProgressJobs(poolID string, jobTypes []string)
 			return fmt.Errorf("need 3 elements back")
 		}
 	}
+}
+
+func (r *deadPoolReaper) filterNonRetryJobs(jobNames []string) []string {
+	filteredJobNames := make([]string, 0)
+	for _, jobName := range jobNames {
+		jobType, ok := r.jobTypes[jobName]
+		if !ok || !jobType.RetryOnStart {
+			continue
+		}
+		filteredJobNames = append(filteredJobNames, jobName)
+	}
+	return filteredJobNames
 }
 
 func (r *deadPoolReaper) findDeadPools() (map[string][]string, error) {
@@ -185,7 +201,7 @@ func (r *deadPoolReaper) findDeadPools() (map[string][]string, error) {
 			continue
 		}
 
-		jobTypesList, err := redis.String(conn.Do("HGET", heartbeatKey, "job_names"))
+		jobNameList, err := redis.String(conn.Do("HGET", heartbeatKey, "job_names"))
 		if err == redis.ErrNil {
 			continue
 		}
@@ -193,7 +209,7 @@ func (r *deadPoolReaper) findDeadPools() (map[string][]string, error) {
 			return nil, err
 		}
 
-		deadPools[workerPoolID] = strings.Split(jobTypesList, ",")
+		deadPools[workerPoolID] = strings.Split(jobNameList, ",")
 	}
 
 	return deadPools, nil

@@ -184,14 +184,23 @@ func (w *worker) fetchJob() (*Job, error) {
 }
 
 func (w *worker) processJob(job *Job) {
-	if job.Unique {
-		w.deleteUniqueJob(job)
-	}
+	defer func() {
+		if job.Unique {
+			w.deleteUniqueJob(job)
+		}
+	}()
 	if jt, ok := w.jobTypes[job.Name]; ok {
+		if jt.StartingDeadline > 0 && job.ScheduledAt > 0 && job.ScheduledAt < jt.StartingDeadline {
+			logInfo("Outdated! StartingDeadline: %d, ScheduledAt: %d, Job: %s\n", jt.StartingDeadline, job.ScheduledAt, job)
+			w.removeJobFromInProgress(job)
+			return
+		}
 		w.observeStarted(job.Name, job.ID, job.Args)
 		job.observer = w.observer // for Checkin
-		_, runErr := runJob(job, w.contextType, w.middleware, jt)
+		middleware := append(w.middleware, jt.middleware...)
+		_, runErr := runJob(job, w.contextType, middleware, jt)
 		w.observeDone(job.Name, job.ID, runErr)
+
 		if runErr != nil {
 			job.failed(runErr)
 			w.addToRetryOrDead(jt, job, runErr)
@@ -235,14 +244,23 @@ func (w *worker) removeJobFromInProgress(job *Job) {
 	}
 }
 
+type NoRetryError struct {
+	msg string
+}
+
+func (n *NoRetryError) Error() string {
+	return n.msg
+}
+
 func (w *worker) addToRetryOrDead(jt *jobType, job *Job, runErr error) {
+	_, isNoRetryError := runErr.(*NoRetryError)
 	failsRemaining := int64(jt.MaxFails) - job.Fails
-	if failsRemaining > 0 {
+	if failsRemaining > 0 && !isNoRetryError {
 		w.addToRetry(job, runErr)
+	} else if !jt.SkipDead {
+		w.addToDead(job, runErr)
 	} else {
-		if !jt.SkipDead {
-			w.addToDead(job, runErr)
-		}
+		w.removeJobFromInProgress(job)
 	}
 }
 

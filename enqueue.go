@@ -30,8 +30,8 @@ func NewEnqueuer(namespace string, pool *redis.Pool) *Enqueuer {
 		Pool:                  pool,
 		queuePrefix:           redisKeyJobsPrefix(namespace),
 		knownJobs:             make(map[string]int64),
-		enqueueUniqueScript:   redis.NewScript(2, redisLuaEnqueueUnique),
-		enqueueUniqueInScript: redis.NewScript(2, redisLuaEnqueueUniqueIn),
+		enqueueUniqueScript:   redis.NewScript(3, redisLuaEnqueueUnique),
+		enqueueUniqueInScript: redis.NewScript(3, redisLuaEnqueueUniqueIn),
 	}
 }
 
@@ -67,10 +67,11 @@ func (e *Enqueuer) Enqueue(jobName string, args map[string]interface{}) (*Job, e
 // EnqueueIn enqueues a job in the scheduled job queue for execution in secondsFromNow seconds.
 func (e *Enqueuer) EnqueueIn(jobName string, secondsFromNow int64, args map[string]interface{}) (*ScheduledJob, error) {
 	job := &Job{
-		Name:       jobName,
-		ID:         makeIdentifier(),
-		EnqueuedAt: nowEpochSeconds(),
-		Args:       args,
+		Name:        jobName,
+		ID:          makeIdentifier(),
+		EnqueuedAt:  nowEpochSeconds(),
+		Args:        args,
+		ScheduledAt: nowEpochSeconds() + secondsFromNow,
 	}
 
 	rawJSON, err := job.serialize()
@@ -98,14 +99,43 @@ func (e *Enqueuer) EnqueueIn(jobName string, secondsFromNow int64, args map[stri
 	return scheduledJob, nil
 }
 
+type EnqueueOp struct {
+	Expire    int
+	UniqueKey string
+}
+
+type EnqueueOption func(*EnqueueOp)
+
+func WithExpireTime(expire int) EnqueueOption {
+	return func(op *EnqueueOp) {
+		op.Expire = expire
+	}
+}
+
+func WithUniqueKey(k string) EnqueueOption {
+	return func(op *EnqueueOp) {
+		op.UniqueKey = k
+	}
+}
+
+const expireTime = 600
+
 // EnqueueUnique enqueues a job unless a job is already enqueued with the same name and arguments.
 // The already-enqueued job can be in the normal work queue or in the scheduled job queue.
-// Once a worker begins processing a job, another job with the same name and arguments can be enqueued again.
+// Only if a job is processed, another job with the same name and arguments can be enqueued again.
 // Any failed jobs in the retry queue or dead queue don't count against the uniqueness -- so if a job fails and is retried, two unique jobs with the same name and arguments can be enqueued at once.
-// In order to add robustness to the system, jobs are only unique for 24 hours after they're enqueued. This is mostly relevant for scheduled jobs.
+// In order to add robustness to the system, jobs are only unique for 10 minutes after they're enqueued. This is mostly relevant for scheduled jobs.
 // EnqueueUnique returns the job if it was enqueued and nil if it wasn't
-func (e *Enqueuer) EnqueueUnique(jobName string, args map[string]interface{}) (*Job, error) {
-	uniqueKey, err := redisKeyUniqueJob(e.Namespace, jobName, args)
+func (e *Enqueuer) EnqueueUnique(jobName string, args map[string]interface{}, opts ...EnqueueOption) (*Job, error) {
+	op := &EnqueueOp{}
+	for _, opt := range opts {
+		opt(op)
+	}
+	expire := expireTime
+	if op.Expire > 0 {
+		expire = op.Expire
+	}
+	args, uniqueKey, err := uniqueKey(op, e.Namespace, jobName, args)
 	if err != nil {
 		return nil, err
 	}
@@ -133,6 +163,7 @@ func (e *Enqueuer) EnqueueUnique(jobName string, args map[string]interface{}) (*
 	scriptArgs := make([]interface{}, 0, 3)
 	scriptArgs = append(scriptArgs, e.queuePrefix+jobName) // KEY[1]
 	scriptArgs = append(scriptArgs, uniqueKey)             // KEY[2]
+	scriptArgs = append(scriptArgs, expire)                // KEY[3]
 	scriptArgs = append(scriptArgs, rawJSON)               // ARGV[1]
 
 	res, err := redis.String(e.enqueueUniqueScript.Do(conn, scriptArgs...))
@@ -143,18 +174,28 @@ func (e *Enqueuer) EnqueueUnique(jobName string, args map[string]interface{}) (*
 }
 
 // EnqueueUniqueIn enqueues a unique job in the scheduled job queue for execution in secondsFromNow seconds. See EnqueueUnique for the semantics of unique jobs.
-func (e *Enqueuer) EnqueueUniqueIn(jobName string, secondsFromNow int64, args map[string]interface{}) (*ScheduledJob, error) {
-	uniqueKey, err := redisKeyUniqueJob(e.Namespace, jobName, args)
+func (e *Enqueuer) EnqueueUniqueIn(jobName string, secondsFromNow int64, args map[string]interface{}, opts ...EnqueueOption) (*ScheduledJob, error) {
+	op := &EnqueueOp{}
+	for _, opt := range opts {
+		opt(op)
+	}
+	expire := expireTime
+	if op.Expire > 0 {
+		expire = op.Expire
+	}
+
+	args, uniqueKey, err := uniqueKey(op, e.Namespace, jobName, args)
 	if err != nil {
 		return nil, err
 	}
 
 	job := &Job{
-		Name:       jobName,
-		ID:         makeIdentifier(),
-		EnqueuedAt: nowEpochSeconds(),
-		Args:       args,
-		Unique:     true,
+		Name:        jobName,
+		ID:          makeIdentifier(),
+		EnqueuedAt:  nowEpochSeconds(),
+		Args:        args,
+		Unique:      true,
+		ScheduledAt: nowEpochSeconds() + secondsFromNow,
 	}
 
 	rawJSON, err := job.serialize()
@@ -177,6 +218,7 @@ func (e *Enqueuer) EnqueueUniqueIn(jobName string, secondsFromNow int64, args ma
 	scriptArgs := make([]interface{}, 0, 4)
 	scriptArgs = append(scriptArgs, redisKeyScheduled(e.Namespace)) // KEY[1]
 	scriptArgs = append(scriptArgs, uniqueKey)                      // KEY[2]
+	scriptArgs = append(scriptArgs, expire)                         // KEY[3]
 	scriptArgs = append(scriptArgs, rawJSON)                        // ARGV[1]
 	scriptArgs = append(scriptArgs, scheduledJob.RunAt)             // ARGV[2]
 
@@ -186,6 +228,19 @@ func (e *Enqueuer) EnqueueUniqueIn(jobName string, secondsFromNow int64, args ma
 		return scheduledJob, nil
 	}
 	return nil, err
+}
+
+const UniqueKeyArg = "unique_job_key"
+
+func uniqueKey(op *EnqueueOp, namespace, jobName string, args map[string]interface{}) (map[string]interface{}, string, error) {
+	if len(op.UniqueKey) > 0 {
+		if args == nil {
+			args = make(map[string]interface{}, 1)
+		}
+		args[UniqueKeyArg] = op.UniqueKey
+	}
+	k, err := redisKeyUniqueJob(namespace, jobName, args)
+	return args, k, err
 }
 
 func (e *Enqueuer) addToKnownJobs(conn redis.Conn, jobName string) error {
